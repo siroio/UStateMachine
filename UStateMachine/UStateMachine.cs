@@ -4,14 +4,42 @@ using System.Runtime.ExceptionServices;
 
 namespace UStateMachine
 {
-    public sealed class UStateMachine
+    /// <summary>
+    /// ステートマシン
+    /// </summary>
+    /// <typeparam name="TContext"></typeparam>
+    public sealed class UStateMachine<TContext> where TContext : class
     {
+        /// <summary>
+        /// ステート基底クラス
+        /// </summary>
         public abstract class UState
         {
+#pragma warning disable CS8618
             private readonly HashSet<Type> destination = new();
+            /// <summary>
+            /// 所属中のステートマシン
+            /// </summary>
+            protected internal UStateMachine<TContext> StateMachine { get; internal set; }
 
+            /// <summary>
+            /// コンテキスト
+            /// </summary>
+            protected internal TContext Context { get; internal set; }
+
+            /// <summary>
+            /// ステート突入
+            /// </summary>
             protected internal virtual void Entry() { }
+
+            /// <summary>
+            /// ステート更新
+            /// </summary>
             protected internal virtual void Update() { }
+
+            /// <summary>
+            /// ステート退出
+            /// </summary>
             protected internal virtual void Exit() { }
 
             /// <summary>
@@ -32,6 +60,7 @@ namespace UStateMachine
             /// <typeparam name="T"></typeparam>
             /// <returns></returns>
             public bool FindState<T>() where T : UState => destination.Contains(typeof(T));
+#pragma warning restore CS8618
         }
 
         /// <summary>
@@ -55,9 +84,24 @@ namespace UStateMachine
         /// </summary>
         public enum MachineState
         {
-            None,
-            Enter,
+            /// <summary>
+            /// 待機
+            /// </summary>
+            Idle,
+
+            /// <summary>
+            /// 突入
+            /// </summary>
+            Entry,
+
+            /// <summary>
+            /// 更新
+            /// </summary>
             Update,
+
+            /// <summary>
+            /// 退出
+            /// </summary>
             Exit
         }
 
@@ -66,9 +110,16 @@ namespace UStateMachine
         /// 登録されたステート一覧
         /// </summary>
         private readonly Dictionary<Type, UState> stateList;
+
+        private int lastThreadID;
         #endregion
 
         #region StateMachine Propertys
+        /// <summary>
+        /// コンテキスト
+        /// </summary>
+        public TContext Context { get; private set; }
+
         /// <summary>
         /// 現在のステート
         /// </summary>
@@ -82,7 +133,7 @@ namespace UStateMachine
         /// <summary>
         /// エラーハンドラー
         /// </summary>
-        public event Func<UStateBaseException, bool> ExceptionHandler;
+        public event Action<Exception>? ExceptionHandler;
 
         /// <summary>
         /// エラーハンドリングのモード
@@ -93,22 +144,39 @@ namespace UStateMachine
         /// ステートマシンの状態
         /// </summary>
         public MachineState State { get; private set; }
+
+        /// <summary>
+        /// 起動中かどうか
+        /// </summary>
+        public bool Running => CurrentState != null;
         #endregion
 
-        public UStateMachine()
+        /// <summary>
+        /// コンストラクタ
+        /// ステートマシーンの初期化
+        /// </summary>
+        /// <param name="Context"></param>
+        /// <exception cref="ArgumentNullException"></exception>
+        public UStateMachine(TContext Context)
         {
+            this.Context = Context ?? throw new ArgumentNullException(nameof(Context));
             stateList = new Dictionary<Type, UState>();
             CurrentState = null;
             NextState = null;
-            ExceptionHandler = (_) => false;
-            State = MachineState.None;
+            State = MachineState.Idle;
             UnHandleException = UnHandleExceptionMode.ThrowException;
         }
 
+        /// <summary>
+        /// ステートマシーンへのステートの登録
+        /// </summary>
+        /// <typeparam name="T"></typeparam>
+        /// <exception cref="UStateAlreadyRunningException"></exception>
+        /// <exception cref="UStateAlreadyRegisterException"></exception>
         public void RegisterState<T>() where T : UState, new()
         {
             var typeInfo = typeof(T);
-            if (State != MachineState.None)
+            if (Running)
             {
                 throw new UStateAlreadyRunningException("StateMachine is Already Running.");
             }
@@ -116,14 +184,19 @@ namespace UStateMachine
             {
                 throw new UStateAlreadyRegisterException("State is Already Registered.");
             }
-
-            stateList.Add(typeInfo, new T());
+            GetStateOrCreate<T>();
         }
 
+        /// <summary>
+        /// ステートマシーンへ登録されているステートの解除
+        /// </summary>
+        /// <typeparam name="T"></typeparam>
+        /// <exception cref="UStateAlreadyRunningException"></exception>
+        /// <exception cref="UStateNotFoundStateException"></exception>
         public void UnRegisterState<T>() where T : UState, new()
         {
             var typeInfo = typeof(T);
-            if (State != MachineState.None)
+            if (Running)
             {
                 throw new UStateAlreadyRunningException("StateMachine is Already Running.");
             }
@@ -134,20 +207,164 @@ namespace UStateMachine
             stateList.Remove(typeof(T));
         }
 
-        private void Error(UStateBaseException exception)
+        public void Update()
         {
-            var error = UnHandleException switch
+            if (State != MachineState.Idle)
             {
-                UnHandleExceptionMode.CatchException => ExceptionHandler?.Invoke(exception),
+                // 多重にUpdateをしてしまうならエラー
+                var currentThreadID = Environment.CurrentManagedThreadId;
+                throw lastThreadID != currentThreadID ?
+                    new InvalidOperationException($"Used in another thread. [UpdateThread={lastThreadID}, CurrentThread={currentThreadID}]") :
+                    new InvalidOperationException("StateMachine is Already Update.");
+            }
+
+            // スレッドIDの取得
+            lastThreadID = Environment.CurrentManagedThreadId;
+
+            // ステートマシンが実行されてなかったら開始処理実行
+            if (!Running) StartUpStateMachine();
+            if (CurrentState == null) throw new UStateNotFoundStateException("CurrentState is null");
+
+            // ステートの更新
+            try
+            {
+                if (NextState == null)
+                {
+                    State = MachineState.Update;
+                    CurrentState.Update();
+                }
+
+                // 次のステートへ推移
+                while (NextState != null)
+                {
+                    State = MachineState.Exit;
+                    CurrentState.Exit();
+
+                    CurrentState = NextState;
+                    NextState = null;
+
+                    State = MachineState.Entry;
+                    CurrentState.Entry();
+                }
+
+                State = MachineState.Idle;
+            }
+            catch (Exception ex)
+            {
+                State = MachineState.Idle;
+                HandleException(ex);
+                return;
+            }
+        }
+
+        /// <summary>
+        /// 開始時の処理
+        /// </summary>
+        /// <exception cref="InvalidOperationException"></exception>
+        private void StartUpStateMachine()
+        {
+            // 開始ステートが設定されているか
+            if (NextState == null)
+            {
+                throw new InvalidOperationException("Please Set The Starting State.");
+            }
+
+            CurrentState = NextState;
+            NextState = null;
+
+            try
+            {
+                State = MachineState.Entry;
+                CurrentState.Entry();
+            }
+            catch (Exception ex)
+            {
+                // 現在のステートをnullに設定
+                NextState = CurrentState;
+                CurrentState = null;
+                // アイルドル状態ににしてハンドラに投げる
+                State = MachineState.Idle;
+                HandleException(ex);
+                return;
+            }
+
+            if (NextState == null)
+            {
+                State = MachineState.Idle;
+                return;
+            }
+        }
+
+        /// <summary>
+        /// 開始時のステートを設定
+        /// </summary>
+        /// <typeparam name="T"></typeparam>
+        /// <exception cref="UStateAlreadyRunningException"></exception>
+        public void SetStartState<T>() where T : UState, new()
+        {
+            if (Running)
+            {
+                throw new UStateAlreadyRunningException("StateMachine is Already Running.");
+            }
+            else if (!stateList.TryGetValue(typeof(T), out var state))
+            {
+                throw new UStateNotFoundStateException("State is Not Found.");
+            }
+            else
+            {
+                NextState = state;
+            }
+        }
+
+
+        /// <summary>
+        /// エラーハンドリング
+        /// </summary>
+        /// <param name="exception"></param>
+        private void HandleException(Exception exception)
+        {
+            bool handle = UnHandleException switch
+            {
+                UnHandleExceptionMode.CatchException => true,
                 UnHandleExceptionMode.ThrowException => false,
-                _ => false,
+                _ => true,
             };
 
-            if (error != null || !error == true) return;
-            ExceptionDispatchInfo.Capture(exception).Throw();
+            if (handle)
+            {
+                ExceptionHandler?.Invoke(exception);
+            }
+            else
+            {
+                ExceptionDispatchInfo.Capture(exception).Throw();
+            }
+        }
+
+        /// <summary>
+        /// ステートを取得
+        /// </summary>
+        /// <typeparam name="T"></typeparam>
+        /// <returns></returns>
+        private UState GetStateOrCreate<T>() where T : UState, new()
+        {
+            var typeInfo = typeof(T);
+            if (!stateList.TryGetValue(typeInfo, out var state))
+            {
+                state = new T
+                {
+                    Context = Context,
+                    StateMachine = this
+                };
+                stateList.Add(typeInfo, state);
+            }
+            return state;
         }
     }
 
+
+    /// <summary>
+    /// 例外ベース
+    /// </summary>
     public class UStateBaseException : Exception
     {
         public UStateBaseException() : base() { }
