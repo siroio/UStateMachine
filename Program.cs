@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Threading;
 using UStateMachine;
 
 namespace Program
@@ -20,6 +21,7 @@ namespace Program
 
             protected internal override void Update()
             {
+                Context.y += 1;
                 Console.WriteLine($"{Context.x} : {Context.y}");
                 Console.WriteLine("Update");
             }
@@ -38,8 +40,13 @@ namespace Program
             stateMachine.RegisterState<Move>();
             stateMachine.SetStartState<Move>();
 
-            stateMachine.Update();
-            stateMachine.Update();
+            int Count = 0;
+            while (Count < 100)
+            {
+                stateMachine.Update();
+                Count++;
+                Thread.Sleep(50);
+            }
         }
     }
 }
